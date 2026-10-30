@@ -23,27 +23,47 @@ jobs:
         with:
           fetch-depth: 1
 
-      # 2) 保活 / 自动恢复机器
+      # 2) 保活 / 自动恢复机器（机器名或 m_ id 均可，统一解析为规范 id 后调用）
       - name: Keep alive / auto-recover
         run: |
           set -euo pipefail
           AUTH="X-API-Key: ${INSTABOX_API_KEY}"
-          STATE=$(curl -sf -H "$AUTH" "$BASE/${MACHINE_ID}" | jq -r '.state')
-          echo "当前状态: $STATE"
+          BASE="https://api.instabox.sh/v1/machines"
+
+          # 查询机器（名字或 m_ id 均可），解析规范 id 与状态
+          json=$(curl -sS -f -H "$AUTH" "$BASE/${MACHINE_ID}") \
+            || { echo "获取机器信息失败：请检查 INSTABOX_MACHINE_ID 与 API key 权限（需 machines:read + machines:write）"; exit 1; }
+          STATE=$(echo "$json" | jq -r '.state')
+          MID=$(echo "$json" | jq -r '.id')
+          echo "当前状态: ${STATE} (机器 id: ${MID})"
+
+          # 统一封装：打印 HTTP 状态码与响应体，失败即返回非 0
+          call_api() { # method path
+            local resp code body
+            resp=$(curl -sS -w $'\n%{http_code}' -X "$1" "$BASE/$MID/$2" \
+                  -H "$AUTH" -H "Content-Type: application/json" \
+                  -H "Idempotency-Key: $(date +%s%N)" || true)
+            code=$(echo "$resp" | tail -1)
+            body=$(echo "$resp" | sed '$d')
+            echo "HTTP ${code}: ${body}"
+            case "$code" in 200|201|202) return 0 ;; *) return 1 ;; esac
+          }
+
           case "$STATE" in
             running)
               # 平台可见命令 -> 重置 30 分钟空闲计时（免费版唯一合法保活通道）
-              curl -sf -X POST "$BASE/${MACHINE_ID}/exec" \
-                   -H "$AUTH" -H "Content-Type: application/json" \
-                   -d '{"cmd":"echo keepalive $(date -u +%FT%TZ)"}'
-              echo "保活命令已发送"
+              resp=$(curl -sS -w $'\n%{http_code}' -X POST "$BASE/$MID/exec" \
+                    -H "$AUTH" -H "Content-Type: application/json" \
+                    -d '{"cmd":"echo keepalive $(date -u +%FT%TZ)"}' || true)
+              echo "保活命令 HTTP $(echo "$resp" | tail -1): $(echo "$resp" | sed '$d')"
               ;;
-            suspended|stopped|error)
-              # start 对 stopped 冷启动、对 suspended 恢复内存进程
-              curl -sf -X POST "$BASE/${MACHINE_ID}/start" \
-                   -H "$AUTH" -H "Content-Type: application/json" \
-                   -H "Idempotency-Key: $(date +%s%N)"
-              echo "已请求启动/恢复"
+            suspended)
+              # 休眠：用 resume 恢复（保留内存与进程）
+              call_api POST resume || { echo "resume 失败"; exit 1; }
+              ;;
+            stopped|error)
+              # 停止/出错：用 start 冷启动
+              call_api POST start || { echo "start 失败"; exit 1; }
               ;;
             *)
               echo "状态 $STATE 正在变化中，本次跳过"
